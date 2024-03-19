@@ -7,9 +7,12 @@ from langchain.embeddings import OpenAIEmbeddings, HuggingFaceInstructEmbeddings
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from dotenv import load_dotenv
-from langchain.chat_models import ChatOpenAI
+from langchain.llms import OpenAI
 import psycopg2
 import io
+from langchain.vectorstores import FAISS
+from langchain.chains.question_answering import load_qa_chain
+from langchain.callbacks import get_openai_callback
 
 app = FastAPI()
 
@@ -43,65 +46,67 @@ def bytes_to_kilobytes(bytes_value):
 
 @app.post('/upload')
 async def pdf_upload(file: UploadFile = File(...)):
+    try:
+        # Return 400 error for non-PDF files
+        if not file:
+            return Response({'msg': 'Please upload a file'}, status_code=400)
+        if not file.filename.endswith('.pdf'):
+            raise HTTPException(
+                status_code=400, detail="Uploaded file must be a PDF")
 
-    # Return 400 error for non-PDF files
-    if not file:
-        return Response({'msg': 'Please upload a file'}, status_code=400)
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(
-            status_code=400, detail="Uploaded file must be a PDF")
+        pdf_binary_data = await file.read()
 
-    pdf_binary_data = await file.read()
+        # converting unreadable binary file into bytes for pdfReader
+        pdf = io.BytesIO(pdf_binary_data)
+        pdf_content = PdfReader(pdf)
 
-    # converting unreadable binary file into bytes for pdfReader
-    pdf = io.BytesIO(pdf_binary_data)
-    pdf_content = PdfReader(pdf)
+        # Fetching content from pdf
+        text = ''
+        for i in pdf_content.pages:
+            text += i.extract_text()
 
-    # Fetching content from pdf
-    text = ''
-    for i in pdf_content.pages:
-        text += i.extract_text()
-
-    # splitting content into chunks to perform semantic search
-    text_spiltter = CharacterTextSplitter(
-        separator='\n',
-        chunk_size=2000,
-        chunk_overlap=200,
-        length_function=len
-    )
-
-    chunks = text_spiltter.split_text(text)
-    if chunks:
-        bytes_value = file.size
-        kilobytes_value = bytes_to_kilobytes(bytes_value)
-        cursor.execute(
-            "INSERT INTO  file(file_name, file_size) VALUES (%s, %s)",
-            (str(file.filename), kilobytes_value)
+        # splitting content into chunks to perform semantic search
+        text_spiltter = CharacterTextSplitter(
+            separator='\n',
+            chunk_size=2000,
+            chunk_overlap=200,
+            length_function=len
         )
-        connection.commit()
-    return {'msg': 'done'}
-    # Creating embedding from chunks
-    # load_dotenv()
-    # embedding = OpenAIEmbeddings()
-    # embedding = HuggingFaceInstructEmbeddings(
-    #     model_name="hkunlp/instructor-xl")
+        chunks = text_spiltter.split_text(text)
+        # if chunks:
+        #     bytes_value = file.size
+        #     kilobytes_value = bytes_to_kilobytes(bytes_value)
+        #     cursor.execute(
+        #         "INSERT INTO  file(file_name, file_size) VALUES (%s, %s)",
+        #         (str(file.filename), kilobytes_value)
+        #     )
+        #     connection.commit()
 
-    # # setting up knowledge base
-    # vectorstore = FAISS.from_texts(texts=chunks, embedding=embedding)
-    # llm = ChatOpenAI(temperature=0.5)
-    # llm = HuggingFaceHub(repo_id="google/flan-t5-xxl",
-    #                      model_kwargs={"temperature": 0.5, "max_length": 512})
-    # print(llm)
-    # memory = ConversationBufferMemory(
-    #     memory_key='chat_history', return_messages=True)
-    # conversation_chain = ConversationalRetrievalChain.from_llm(
-    #     llm=llm,
-    #     retriever=vectorstore.as_retriever(),
-    #     memory=memory
-    # )
-    # print(conversation_chain)
+        # retriving OpenAI api key
+        load_dotenv()
+        # Creating embedding from chunks
+        embeddings = OpenAIEmbeddings()
 
-    # return {'msg': 'done'}
+        # Setting up knowledge base based on chunks
+        knowledge_base = FAISS.from_texts(chunks, embeddings)
+        user_question = 'What are ACHIEVEMENTS in the file?'
+
+        # Performing similarity search based on user's question
+        docs = knowledge_base.similarity_search(user_question)
+
+        # Using LLM model to setup chain of the knowledge and retrive the appropriate answer
+        llm = OpenAI(model="gpt-3.5-turbo-instruct")
+        chain = load_qa_chain(llm, chain_type="stuff")
+
+        # this is for debuging purpose only
+        with get_openai_callback() as cb:
+            response = chain.run(input_documents=docs, question=user_question)
+            print(cb)
+
+        return response
+
+    except Exception as error:
+        return {'error': error}
 
 
 @app.get('/pdfs')
